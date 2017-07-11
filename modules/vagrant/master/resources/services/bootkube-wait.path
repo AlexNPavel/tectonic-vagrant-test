@@ -1,0 +1,5 @@
+[Path]
+PathExists=/opt/tectonic/bootkube.sh
+
+[Install]
+WantedBy=multi-user.target

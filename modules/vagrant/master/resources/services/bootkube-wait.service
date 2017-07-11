@@ -1,0 +1,9 @@
+[Unit]
+Before=bootkube.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bash /opt/tectonic/bootkube-wait.sh
+
+[Install]
+WantedBy=multi-user.target

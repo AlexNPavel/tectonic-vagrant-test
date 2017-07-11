@@ -21,19 +21,24 @@ if not plugins_to_install.empty?
   end
 end
 
-# this needs to remain as alpha until a version >= 1451 is bumped to beta or stable
 $update_channel = "alpha"
 $controller_count = 1
 $controller_vm_memory = 2048
-$worker_count = 2
+$worker_count = 1
 $worker_vm_memory = 1024
 
 if $worker_vm_memory < 1024
   puts "Workers should have at least 1024 MB of memory"
 end
 
-IGNITION_CONTROLLER_DATA_PATH = File.expand_path("config-controller.ign")
-IGNITION_WORKER_DATA_PATH = File.expand_path("config-worker.ign")
+CONTROLLER_IGNITION_PATH = File.expand_path("./master.ign")
+WORKER_IGNITION_PATH = File.expand_path("./worker.ign")
+KUBECONFIG_PATH = File.expand_path("generated/auth/kubeconfig")
+CA_CERT_PATH = File.expand_path("generated/tls/ca.crt")
+
+def etcdIP(num)
+  return "172.17.4.#{num+50}"
+end
 
 def controllerIP(num)
   return "172.17.4.#{num+100}"
@@ -43,21 +48,33 @@ def workerIP(num)
   return "172.17.4.#{num+200}"
 end
 
+$self_host_etcd = true if ENV['SELF_HOST_ETCD'] == "true"
+if !$self_host_etcd
+    $etcd_count = 0
+    $etcd_vm_memory = 512
+    ETCD_IGNITION_PATH = File.expand_path("./etcd.ign")
+    etcdIPs = [*1..$etcd_count].map{ |i| etcdIP(i) }
+    initial_etcd_cluster = etcdIPs.map.with_index{ |ip, i| "e#{i+1}=https://#{ip}:2380" }.join(",")
+end
+
 Vagrant.configure("2") do |config|
   # always use Vagrant's insecure key
   config.ssh.insert_key = false
 
-  config.vm.box = "coreos-%s" % $update_channel
-  config.vm.box_version = ">= 1451.0.0"
-  config.vm.box_url = "http://%s.release.core-os.net/amd64-usr/current/coreos_production_vagrant.json" % $update_channel
+  config.vm.box = "coreos-alpha"
+  config.vm.box_url = "https://alpha.release.core-os.net/amd64-usr/current/coreos_production_vagrant_virtualbox.json"
+
+  ["vmware_fusion", "vmware_workstation"].each do |vmware|
+    config.vm.provider vmware do |v, override|
+      override.vm.box_url = "http://%s.release.core-os.net/amd64-usr/current/coreos_production_vagrant_vmware_fusion.json" % $update_channel
+    end
+  end
 
   config.vm.provider :virtualbox do |v|
     # On VirtualBox, we don't have guest additions or a functional vboxsf
     # in CoreOS, so tell Vagrant that so it can be smarter.
     v.check_guest_additions = false
     v.functional_vboxsf     = false
-    # enable ignition (this is always done on virtualbox as this is how the ssh key is added to the system)
-    config.ignition.enabled = true
   end
 
   # plugin conflict
@@ -65,52 +82,170 @@ Vagrant.configure("2") do |config|
     config.vbguest.auto_update = false
   end
 
+  ["vmware_fusion", "vmware_workstation"].each do |vmware|
+    config.vm.provider vmware do |v|
+      v.vmx['numvcpus'] = 1
+      v.gui = false
+    end
+  end
+
   config.vm.provider :virtualbox do |vb|
     vb.cpus = 1
     vb.gui = false
   end
 
-  (1..$controller_count).each do |i|
-    config.vm.define vm_name = "c%d" % i do |controller|
-      controller.vm.hostname = vm_name
+  if !$self_host_etcd
+    (1..$etcd_count).each do |i|
+      config.vm.define vm_name = "e%d" % i do |etcd|
 
-      controller.vm.provider :virtualbox do |vb|
-        vb.memory = $controller_vm_memory
-        config.ignition.config_obj = vb
-      end
+        data = File.read(ETCD_IGNITION_PATH)
+        data = data.gsub("ETCD_INITIAL_CLUSTER", initial_etcd_cluster)
+        etcd_config_file = Tempfile.new('etcd_config')
+        etcd_config_file.write(data)
+        etcd_config_file.close
 
-      controllerIP = controllerIP(i)
-      controller.vm.network :private_network, ip: controllerIP
-      # This is necessary for ignition
-      config.ignition.ip = ip
-      config.vm.provider :virtualbox do |vb|
-        config.ignition.hostname = controller.vm.hostname
-        config.ignition.config_vmdk = File.join(File.dirname(__FILE__), "config-controller-" + i.to_s  + ".vmdk")
-        config.ignition.config_img = "config-controller-" + i.to_s  + ".img"
-        config.ignition.path = IGNITION_CONTROLLER_DATA_PATH
+        etcd.vm.hostname = vm_name
+
+        ["vmware_fusion", "vmware_workstation"].each do |vmware|
+          etcd.vm.provider vmware do |v|
+            v.vmx['memsize'] = $etcd_vm_memory
+          end
+        end
+
+        etcd.vm.provider :virtualbox do |vb|
+          vb.memory = $etcd_vm_memory
+          etcd.ignition.enabled = true
+          etcd.ignition.config_obj = vb
+        end
+
+        etcdIP = etcdIP(i)
+        etcd.vm.network :private_network, ip: etcdIP
+        etcd.ignition.ip = etcdIP
+
+        etcd.vm.provider :virtualbox do |vb|
+          etcd.ignition.hostname = vm_name
+          etcd.ignition.config_vmdk = File.join(File.dirname(__FILE__), "config-etcd-" + i.to_s  + ".vmdk")
+          etcd.ignition.config_img = "config-etcd-" + i.to_s  + ".img"
+          # when the ignition config doesn't exist, the plugin automatically generates a very basic Ignition with the ssh key
+          # and previously specified options (ip and hostname). Otherwise, it appends those to the provided config.ign below
+          etcd.ignition.path = etcd_config_file.path
+        end
+
+        etcd_cert_file = "generated/tls/operator/etcd-ca-crt.pem"
+        etcd.vm.provision :file, :source => File.expand_path(etcd_cert_file), :destination => "/tmp/#{File.expand_path(etcd_cert_file)}"
+        etcd.vm.provision :shell, :inline => "mv /tmp/#{File.expand_path(etcd_cert_file)} /etc/ssl/certs/etcd-ca.crt", :privileged => true
+
+        etcd_cert_file = "generated/tls/operator/etcd-crt.pem"
+        etcd.vm.provision :file, :source => File.expand_path(etcd_cert_file), :destination => "/tmp/#{File.expand_path(etcd_cert_file)}"
+        etcd.vm.provision :shell, :inline => "mv /tmp/#{File.expand_path(etcd_cert_file)} /etc/ssl/certs/etcd-client.crt", :privileged => true
+
+        etcd_cert_file = "generated/tls/operator/etcd-key.pem"
+        etcd.vm.provision :file, :source => File.expand_path(etcd_cert_file), :destination => "/tmp/#{File.expand_path(etcd_cert_file)}"
+        etcd.vm.provision :shell, :inline => "mv /tmp/#{File.expand_path(etcd_cert_file)} /etc/ssl/certs/etcd-client.key", :privileged => true
+
+        etcd_cert_file = "generated/tls/peer/etcd-peer.crt"
+        etcd.vm.provision :file, :source => File.expand_path(etcd_cert_file), :destination => "/tmp/#{File.expand_path(etcd_cert_file)}"
+        etcd.vm.provision :shell, :inline => "mv /tmp/#{File.expand_path(etcd_cert_file)} /etc/ssl/certs/etcd-peer.crt", :privileged => true
+
+        etcd_cert_file = "generated/tls/peer/etcd-peer.key"
+        etcd.vm.provision :file, :source => File.expand_path(etcd_cert_file), :destination => "/tmp/#{File.expand_path(etcd_cert_file)}"
+        etcd.vm.provision :shell, :inline => "mv /tmp/#{File.expand_path(etcd_cert_file)} /etc/ssl/certs/etcd-peer.key", :privileged => true
+
+        etcd.vm.provision :shell, :inline => "chown -R etcd:etcd /etc/ssl/certs/etcd-*", :privileged => true
+        etcd.vm.provision :shell, :inline => "chmod -R u=rX,g=,o= /etc/ssl/certs/etcd-*", :privileged => true
       end
     end
   end
 
+
+  (1..$controller_count).each do |i|
+    config.vm.define vm_name = "c%d.vagrant" % i do |controller|
+      controller.vm.hostname = vm_name
+
+      ["vmware_fusion", "vmware_workstation"].each do |vmware|
+        controller.vm.provider vmware do |v|
+          v.vmx['memsize'] = $controller_vm_memory
+        end
+      end
+
+      controller.vm.provider :virtualbox do |vb|
+        vb.memory = $controller_vm_memory
+        controller.ignition.enabled = true
+        controller.ignition.config_obj = vb
+        vb.customize ["modifyvm", :id, "--natdnspassdomain1", "on"]
+        vb.customize ["setextradata", :id, "VBoxInternal/Devices/virtio-net/0/LUN#0/Config/HostResolverMappings/c1/HostIP", "172.17.4.101"]
+        vb.customize ["setextradata", :id, "VBoxInternal/Devices/virtio-net/0/LUN#0/Config/HostResolverMappings/c1/HostName", "c1.vagrant"]
+        vb.customize ["setextradata", :id, "VBoxInternal/Devices/virtio-net/0/LUN#0/Config/HostResolverMappings/tectonic/HostIP", "172.17.4.201"]
+        vb.customize ["setextradata", :id, "VBoxInternal/Devices/virtio-net/0/LUN#0/Config/HostResolverMappings/tectonic/HostName", "tectonic.vagrant"]
+      end
+
+      controllerIP = controllerIP(i)
+      controller.vm.network :private_network, ip: controllerIP
+      controller.ignition.ip = controllerIP
+
+      controller.vm.provider :virtualbox do |vb|
+        controller.ignition.hostname = vm_name
+        controller.ignition.config_vmdk = File.join(File.dirname(__FILE__), "config-controller-" + i.to_s  + ".vmdk")
+        controller.ignition.config_img = "config-controller-" + i.to_s  + ".img"
+        # when the ignition config doesn't exist, the plugin automatically generates a very basic Ignition with the ssh key
+        # and previously specified options (ip and hostname). Otherwise, it appends those to the provided config.ign below
+        controller.ignition.path = CONTROLLER_IGNITION_PATH
+      end
+
+      controller.vm.provision :shell, :inline => "mkdir -p /etc/kubernetes", :privileged => true
+
+      controller.vm.provision :file, :source => KUBECONFIG_PATH, :destination => "/tmp/kubeconfig"
+      controller.vm.provision :shell, :inline => "mv /tmp/kubeconfig /etc/kubernetes/kubeconfig", :privileged => true
+
+#      controller.vm.provision :file, :source => CA_CERT_PATH, :destination => "/tmp/ca.crt"
+#      controller.vm.provision :shell, :inline => "mv /tmp/ca.crt /etc/kubernetes/ca.crt", :privileged => true
+
+      controller.vm.provision :file, :source => 'generated', :destination => '/tmp/tectonic'
+      controller.vm.provision :shell, :inline => "rm -rf /opt/tectonic; mv /tmp/tectonic /opt/tectonic", :privileged => true
+    end
+  end
+
   (1..$worker_count).each do |i|
-    config.vm.define vm_name = "w%d" % i do |worker|
+    config.vm.define vm_name = "w%d.vagrant" % i do |worker|
       worker.vm.hostname = vm_name
+
+      ["vmware_fusion", "vmware_workstation"].each do |vmware|
+        worker.vm.provider vmware do |v|
+          v.vmx['memsize'] = $worker_vm_memory
+        end
+      end
 
       worker.vm.provider :virtualbox do |vb|
         vb.memory = $worker_vm_memory
-        config.ignition.config_obj = vb
+        worker.ignition.enabled = true
+        worker.ignition.config_obj = vb
+        vb.customize ["modifyvm", :id, "--natdnspassdomain1", "on"]
+        vb.customize ["setextradata", :id, "VBoxInternal/Devices/virtio-net/0/LUN#0/Config/HostResolverMappings/c1/HostIP", "172.17.4.101"]
+        vb.customize ["setextradata", :id, "VBoxInternal/Devices/virtio-net/0/LUN#0/Config/HostResolverMappings/c1/HostName", "c1.vagrant"]
+        vb.customize ["setextradata", :id, "VBoxInternal/Devices/virtio-net/0/LUN#0/Config/HostResolverMappings/tectonic/HostIP", "172.17.4.101"]
+        vb.customize ["setextradata", :id, "VBoxInternal/Devices/virtio-net/0/LUN#0/Config/HostResolverMappings/tectonic/HostName", "tectonic.vagrant"]
       end
 
       workerIP = workerIP(i)
       worker.vm.network :private_network, ip: workerIP
-      # This is necessary for ignition
-      config.ignition.ip = ip
-      config.vm.provider :virtualbox do |vb|
-        config.ignition.hostname = worker.vm.hostname
-        config.ignition.config_vmdk = File.join(File.dirname(__FILE__), "config-worker-" + i.to_s  + ".vmdk")
-        config.ignition.config_img = "config-worker-" + i.to_s  + ".img"
-        config.ignition.path = IGNITION_WORKER_DATA_PATH
+      worker.ignition.ip = workerIP
+
+      worker.vm.provider :virtualbox do |vb|
+        worker.ignition.hostname = vm_name
+        worker.ignition.config_vmdk = File.join(File.dirname(__FILE__), "config-worker-" + i.to_s  + ".vmdk")
+        worker.ignition.config_img = "config-worker-" + i.to_s  + ".img"
+        # when the ignition config doesn't exist, the plugin automatically generates a very basic Ignition with the ssh key
+        # and previously specified options (ip and hostname). Otherwise, it appends those to the provided config.ign below
+        worker.ignition.path = WORKER_IGNITION_PATH
       end
+
+      worker.vm.provision :shell, :inline => "mkdir -p /etc/kubernetes", :privileged => true
+
+      worker.vm.provision :file, :source => KUBECONFIG_PATH, :destination => "/tmp/kubeconfig"
+      worker.vm.provision :shell, :inline => "mv /tmp/kubeconfig /etc/kubernetes/kubeconfig", :privileged => true
+
+#      worker.vm.provision :file, :source => CA_CERT_PATH, :destination => "/tmp/ca.crt"
+#      worker.vm.provision :shell, :inline => "mv /tmp/ca.crt /etc/kubernetes/ca.crt", :privileged => true
     end
   end
 end
